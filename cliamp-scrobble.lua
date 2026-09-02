@@ -96,6 +96,25 @@ local function log_info(text)
     end
 end
 
+local function dump_table(v, depth)
+    depth = depth or 0
+    if depth > 4 then return "..." end
+    if v == nil then return "nil" end
+    local t = type(v)
+    if t == "table" then
+        local parts = {}
+        for k, val in pairs(v) do
+            table.insert(parts, tostring(k) .. "=" .. dump_table(val, depth + 1))
+        end
+        table.sort(parts)
+        return "{" .. table.concat(parts, ", ") .. "}"
+    elseif t == "string" then
+        return string.format("%q", v)
+    else
+        return tostring(v)
+    end
+end
+
 local function trim(value)
     if value == nil then return nil end
     value = tostring(value):gsub("^%s+", ""):gsub("%s+$", "")
@@ -534,7 +553,27 @@ local function current_track()
     return track
 end
 
+local function dump_live_track()
+    if not cliamp.track then return "{}" end
+    local data = {}
+    local fields = { "title", "artist", "album", "genre", "year", "track_number", "path", "is_stream", "duration_secs" }
+    for _, fn_name in ipairs(fields) do
+        if type(cliamp.track[fn_name]) == "function" then
+            local ok, val = pcall(function() return cliamp.track[fn_name]() end)
+            if ok then
+                data[fn_name] = val
+            else
+                data[fn_name] = "<err: " .. tostring(val) .. ">"
+            end
+        end
+    end
+    return dump_table(data)
+end
+
 local function reset_session()
+    if session then
+        log_info("Last.fm session reset (was: " .. dump_table(session) .. ")")
+    end
     session = nil
 end
 
@@ -551,21 +590,118 @@ local function session_item()
     }
 end
 
-local function is_current_session_track(track)
-    if not session then return false end
-    return trim(track.artist) == trim(session.artist)
-        and trim(track.title or track.track) == trim(session.title)
+local function clean_track_metadata(artist, title)
+    artist = trim(artist)
+    title = trim(title)
+
+    if not title then return artist, title end
+
+    -- Check if title is in "Artist - Title" format
+    local p_artist, p_title = string.match(title, "^%s*(.-)%s+%-+%s+(.+)%s*$")
+    if p_artist and p_title and trim(p_artist) and trim(p_title) then
+        p_artist = trim(p_artist)
+        p_title = trim(p_title)
+
+        if artist and lower(artist) == lower(p_artist) then
+            -- Duplicate artist in title: e.g. artist="Ghostly Kisses", title="Ghostly Kisses - Fade from Me"
+            title = p_title
+        elseif not artist or artist == "" or artist == "YouTube" or artist == "YouTube Music" then
+            artist = p_artist
+            title = p_title
+        else
+            -- If title explicitly defines Artist - Title (e.g. uploader channel "Vinyl Great" vs song "Savage - Radio")
+            artist = p_artist
+            title = p_title
+        end
+    elseif artist and title then
+        -- Check if title starts with artist name followed by separator like ': ' or ' - '
+        local escaped_artist = string.gsub(artist, "([%^%$%(%)%%%.%[%]%*%+%-%?])", "%%%1")
+        local stripped = string.match(title, "^" .. escaped_artist .. "%s*[:%-–—]%s*(.+)$")
+        if stripped and trim(stripped) then
+            title = trim(stripped)
+        end
+    end
+
+    -- Remove common YouTube video suffixes (e.g. "(Lyrics Video)", "(Official Video)", etc.)
+    local suffixes = {
+        "%s*%(%s*[Ll]yric[s]?%s*[Vv]ideo%s*%)%s*$",
+        "%s*%[%s*[Ll]yric[s]?%s*[Vv]ideo%s*%]%s*$",
+        "%s*%(%s*[Oo]fficial%s*[Mm]usic%s*[Vv]ideo%s*%)%s*$",
+        "%s*%[%s*[Oo]fficial%s*[Mm]usic%s*[Vv]ideo%s*%]%s*$",
+        "%s*%(%s*[Oo]fficial%s*[Ll]yric[s]?%s*[Vv]ideo%s*%)%s*$",
+        "%s*%[%s*[Oo]fficial%s*[Ll]yric[s]?%s*[Vv]ideo%s*%]%s*$",
+        "%s*%(%s*[Oo]fficial%s*[Vv]ideo%s*%)%s*$",
+        "%s*%[%s*[Oo]fficial%s*[Vv]ideo%s*%]%s*$",
+        "%s*%(%s*[Oo]fficial%s*[Aa]udio%s*%)%s*$",
+        "%s*%[%s*[Oo]fficial%s*[Aa]udio%s*%]%s*$",
+        "%s*%(%s*[Mm]usic%s*[Vv]ideo%s*%)%s*$",
+        "%s*%[%s*[Mm]usic%s*[Vv]ideo%s*%]%s*$",
+        "%s*%(%s*[Vv]ideo%s*[Cc]lip%s*%)%s*$",
+        "%s*%[%s*[Vv]ideo%s*[Cc]lip%s*%]%s*$",
+        "%s*%(%s*[Cc]lip%s*[Oo]fficiel%s*%)%s*$",
+        "%s*%[%s*[Cc]lip%s*[Oo]fficiel%s*%]%s*$",
+        "%s*%(%s*[Vv]isualizer%s*%)%s*$",
+        "%s*%[%s*[Vv]isualizer%s*%]%s*$",
+        "%s*%(%s*[Ll]yrics%s*%)%s*$",
+        "%s*%[%s*[Ll]yrics%s*%]%s*$",
+        "%s*%(%s*[Aa]udio%s*%)%s*$",
+        "%s*%[%s*[Aa]udio%s*%]%s*$",
+        "%s*%(%s*[Hh][Dd]%s*%)%s*$",
+        "%s*%[%s*[Hh][Dd]%s*%]%s*$",
+        "%s*%(%s*4[Kk]%s*%)%s*$",
+        "%s*%[%s*4[Kk]%s*%]%s*$",
+        "%s*%(%s*[Hh][Qq]%s*%)%s*$",
+        "%s*%[%s*[Hh][Qq]%s*%]%s*$",
+        "%s*%(%s*[Vv]ideo%s*%)%s*$",
+        "%s*%[%s*[Vv]ideo%s*%]%s*$",
+    }
+
+    for _, pat in ipairs(suffixes) do
+        title = string.gsub(title, pat, "")
+    end
+
+    title = trim(title)
+    artist = trim(artist)
+
+    return artist, title
 end
 
+local function is_current_session_track(track)
+    if not session then return false end
+    local art = trim(track.artist)
+    local tit = trim(track.title or track.track)
+    if art == trim(session.artist) and tit == trim(session.title) then
+        return true
+    end
+    if session.raw_artist and session.raw_title and art == trim(session.raw_artist) and tit == trim(session.raw_title) then
+        return true
+    end
+    local c_art, c_tit = clean_track_metadata(art, tit)
+    return c_art == trim(session.artist) and c_tit == trim(session.title)
+end
+
+local poller_warned_no_session = false
+local poller_warned_invalid = false
+
 local function start_session(track)
+    poller_warned_no_session = false
+    poller_warned_invalid = false
     track = track or {}
     local live = current_track()
     local duration = tonumber(track.duration or track.duration_secs or live.duration or 0) or 0
 
+    local raw_title = trim(track.title) or live.title
+    local raw_artist = trim(track.artist) or live.artist
+    local album = trim(track.album) or live.album
+
+    local artist, title = clean_track_metadata(raw_artist, raw_title)
+
     session = {
-        title = trim(track.title) or live.title,
-        artist = trim(track.artist) or live.artist,
-        album = trim(track.album) or live.album,
+        raw_title = raw_title,
+        raw_artist = raw_artist,
+        title = title,
+        artist = artist,
+        album = album,
         duration = duration,
         listened = 0,
         last_position = nil,
@@ -575,10 +711,16 @@ local function start_session(track)
         now_playing_sent = false,
     }
 
+    if raw_title ~= title or raw_artist ~= artist then
+        log_info("Last.fm cleaned track name: raw='" .. tostring(raw_artist) .. " - " .. tostring(raw_title) .. "' -> cleaned='" .. tostring(session.artist) .. " - " .. tostring(session.title) .. "'")
+    end
+
+    log_info("Last.fm track session initialized: track=" .. dump_table(track) .. ", live_track=" .. dump_live_track() .. ", session=" .. dump_table(session))
+
     if valid_for_scrobble(session) then
-        log_info("Last.fm tracking " .. session.artist .. " - " .. session.title .. " (" .. tostring(math.floor(session.duration)) .. "s)")
+        log_info("Last.fm tracking " .. tostring(session.artist) .. " - " .. tostring(session.title) .. " (" .. tostring(math.floor(session.duration)) .. "s)")
     else
-        log_warn("Last.fm ignoring track with missing metadata or duration")
+        log_warn("Last.fm ignoring track: artist='" .. tostring(session.artist or "") .. "', title='" .. tostring(session.title or "") .. "', duration=" .. tostring(session.duration or 0) .. "s (requires artist, title, duration > 30s)")
     end
 end
 
@@ -606,17 +748,35 @@ local function player_position()
 end
 
 local function maybe_scrobble()
-    if not session or not enabled then return end
-    if not valid_for_scrobble(session) then return end
+    if not enabled then return end
 
     local state = player_state()
     local position = player_position()
     local checked_at = now()
 
     if state ~= "playing" then
-        session.last_position = position
-        session.last_checked = checked_at
-        session.now_playing_sent = false
+        if session then
+            session.last_position = position
+            session.last_checked = checked_at
+            session.now_playing_sent = false
+        end
+        poller_warned_no_session = false
+        return
+    end
+
+    if not session then
+        if not poller_warned_no_session then
+            log_warn("Last.fm poller active (playing) but session is nil (live_track=" .. dump_live_track() .. ")")
+            poller_warned_no_session = true
+        end
+        return
+    end
+
+    if not valid_for_scrobble(session) then
+        if not poller_warned_invalid then
+            log_warn("Last.fm active session invalid for scrobble: session=" .. dump_table(session) .. ", live_track=" .. dump_live_track())
+            poller_warned_invalid = true
+        end
         return
     end
 
@@ -647,6 +807,8 @@ local function maybe_scrobble()
 
     if session.listened < (session.duration * threshold) then return end
 
+    log_info("Last.fm scrobble threshold reached. Dumping session=" .. dump_table(session) .. ", session_item=" .. dump_table(session_item()))
+
     if scrobble_item(session_item(), true) then
         session.scrobbled = true
     else
@@ -655,11 +817,17 @@ local function maybe_scrobble()
 end
 
 local function love_current_track()
-    local track = current_track()
-    if not trim(track.artist) or not trim(track.title) then
+    local raw_track = current_track()
+    local artist, title = clean_track_metadata(raw_track.artist, raw_track.title)
+    if not artist or not title then
         message(lastfm_message("missing artist/title", "#FF991C"))
         return
     end
+
+    local track = {
+        artist = artist,
+        title = title,
+    }
 
     local loved, info_err = track_userloved(track)
     if loved == nil then
@@ -721,11 +889,18 @@ p:bind("*", "Love/unlove current track on Last.fm", love_current_track)
 p:bind("&", "Toggle Last.fm scrobbling", toggle_scrobbling)
 
 p:on("track.change", function(track)
+    log_info("Last.fm track.change event fired: track=" .. dump_table(track) .. ", live_track=" .. dump_live_track())
     start_session(track or {})
 end)
 
+local last_logged_playback_state = nil
+
 p:on("playback.state", function()
     local state = player_state()
+    if state ~= last_logged_playback_state then
+        log_info("Last.fm playback.state: " .. tostring(last_logged_playback_state or "nil") .. " -> " .. tostring(state) .. ", session=" .. dump_table(session))
+        last_logged_playback_state = state
+    end
     if state == "stopped" or state == "stop" then
         reset_session()
     end
