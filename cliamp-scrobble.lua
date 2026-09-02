@@ -765,11 +765,18 @@ local function maybe_scrobble()
     end
 
     if not session then
-        if not poller_warned_no_session then
-            log_warn("Last.fm poller active (playing) but session is nil (live_track=" .. dump_live_track() .. ")")
-            poller_warned_no_session = true
+        -- Try to recover by creating a session from live_track
+        local live = current_track()
+        if live and (trim(live.title) or trim(live.artist)) then
+            log_info("Last.fm poller: session is nil while playing, recovering from live_track=" .. dump_live_track())
+            start_session(live)
+        else
+            if not poller_warned_no_session then
+                log_warn("Last.fm poller active (playing) but session is nil and no live_track metadata available")
+                poller_warned_no_session = true
+            end
+            return
         end
-        return
     end
 
     if not valid_for_scrobble(session) then
@@ -903,6 +910,14 @@ p:on("playback.state", function()
     end
     if state == "stopped" or state == "stop" then
         reset_session()
+    elseif (state == "playing") and not session then
+        -- No track.change was fired (e.g. first track after app start).
+        -- Create a session from live_track metadata.
+        local live = current_track()
+        if live and (trim(live.title) or trim(live.artist)) then
+            log_info("Last.fm playback.state: no session found, creating from live_track=" .. dump_live_track())
+            start_session(live)
+        end
     end
 end)
 
